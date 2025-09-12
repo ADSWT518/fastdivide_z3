@@ -1,0 +1,8 @@
+[package]
+name = "tnum_z3_verification"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+z3 = "0.12"
+fastdivide = "0.4"
