@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["main","verify_fast_divide_correctness","verify_with_z3"],"struct":["Tnum"]};
