@@ -879,22 +879,22 @@ impl Tnum {
             let divider = DividerU64::divide_by(other.value);
             match divider {
                 DividerU64::Fast { magic, shift } => {
-                    // 修正：使用32位magic number算法
-                    // 正确公式: ((dividend * magic) >> 32) >> shift
-                    let product = (self.value as u64).wrapping_mul(magic);
-                    let high_part = product >> 32;  // 取高32位
+                    // 修正：使用64位magic number算法
+                    // 正确公式: ((dividend * magic) >> 64) >> shift
+                    let product = (self.value as u128).wrapping_mul(magic.into());
+                    let high_part = (product >> 64) as u64;  // 取高64位
                     let result_value = high_part >> shift;
                     
                     // 对于mask的处理（保守估计）
-                    let mask_product = (self.mask as u64).wrapping_mul(magic);
-                    let mask_high = mask_product >> 32;
+                    let mask_product = (self.mask as u128).wrapping_mul(magic.into());
+                    let mask_high = (mask_product >> 64) as u64;
                     let result_mask = mask_high >> shift;
                     
                     return Self::new(result_value, result_mask);
                     // println!("  - Strategy: Fast Path");
                     // println!("  - Magic (M): 0x{:X} ({})", magic, magic);
                     // println!("  - Shift (s): {}", shift);
-                    // println!("  - Formula: ((n * M) >> 32) >> s");
+                    // println!("  - Formula: ((n * M) >> 64) >> s");
                 }
                 DividerU64::BitShift(shift) => {
                     return self.tnum_rshift(shift as u8);
@@ -1287,7 +1287,7 @@ impl<'ctx> FastDivideVerifier<'ctx> {
         
         // 枚举被除数和除数的组合
         for dividend_value in 0..=1000u64 {
-            for divisor_value in 3..=3u64 { // 除数从1开始，避免除零
+            for divisor_value in 1..=1000u64 { // 除数从1开始，避免除零
                 // 使用常数 Tnum：mask = 0
                 let dividend_tnum = Tnum::const_val(dividend_value);
                 let divisor_tnum = Tnum::const_val(divisor_value);
