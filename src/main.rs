@@ -1,9 +1,7 @@
 //! This is a tnum implementation for Solana eBPF
-//! Z3 Verification for fast_divide algorithm
+//! Direct enumeration verification for fast_divide algorithm (without Z3)
 use fastdivide::DividerU64;
 use std::u64;
-use z3::ast::{Ast, BV, Bool};
-use z3::{Config, Context, Solver, Sort, SatResult};
 
 fn testbit(val: u64, bit: u8) -> bool {
     if bit >= 64 {
@@ -881,14 +879,21 @@ impl Tnum {
                 DividerU64::Fast { magic, shift } => {
                     // 修正：使用64位magic number算法
                     // 正确公式: ((dividend * magic) >> 64) >> shift
-                    let product = (self.value as u128).wrapping_mul(magic.into());
-                    let high_part = (product >> 64) as u64;  // 取高64位
-                    let result_value = high_part >> shift;
+                    // let product = (self.value as u128).wrapping_mul(magic.into());
+                    // let high_part = (product >> 64) as u64;  // 取高64位
+                    // let result_value = high_part >> shift;
                     
-                    // 对于mask的处理（保守估计）
-                    let mask_product = (self.mask as u128).wrapping_mul(magic.into());
-                    let mask_high = (mask_product >> 64) as u64;
-                    let result_mask = mask_high >> shift;
+                    // // 对于mask的处理（保守估计）
+                    // let mask_product = (self.mask as u128).wrapping_mul(magic.into());
+                    // let mask_high = (mask_product >> 64) as u64;
+                    // let result_mask = mask_high >> shift;
+
+
+                    let Tnum_magic = TnumU128::new(magic as u128, 0);
+                    let self_u128 = TnumU128::new(self.value as u128, self.mask as u128);
+                    let temp = self_u128.mul(Tnum_magic);
+                    let result_value = (temp.value >> 64) as u64 >> shift;
+                    let result_mask = (temp.mask >> 64) as u64 >> shift;
                     
                     return Self::new(result_value, result_mask);
                     // println!("  - Strategy: Fast Path");
@@ -1225,249 +1230,75 @@ pub fn rem_get_low_bits(lhs: &Tnum, rhs: &Tnum) -> Tnum {
 
     Tnum::top()
 }
-/// Z3验证框架：寻找fast_divide算法的反例
-pub struct FastDivideVerifier<'ctx> {
-    context: &'ctx Context,
-    solver: Solver<'ctx>,
-}
 
-impl<'ctx> FastDivideVerifier<'ctx> {
-    pub fn new(ctx: &'ctx Context) -> Self {
-        let solver = Solver::new(ctx);
-        Self {
-            context: ctx,
-            solver,
-        }
-    }
+/// 比较 fast_divide 与 sdiv 的精度
+fn compare_fast_divide_with_sdiv() {
+    println!("=== 比较 fast_divide 与 sdiv 的精度 ===");
+    println!("比较思路：");
+    println!("1. 枚举被除数 Tnum_a(value_a, mask_a)，其中 value_a & mask_a == 0");
+    println!("2. 枚举除数 Tnum_b(value_b, 0) - 常数");
+    println!("3. 分别计算 fast_divide 和 sdiv 的结果");
+    println!("4. 使用 le 和 eq 函数比较两种算法的精度关系");
+    println!();
 
-    pub fn reset(&self) {
-        self.solver.reset();
-    }
+    let mut total_cases = 0;
+    let mut fast_le_sdiv = 0;    // fast_divide ⊆ sdiv (fast_divide 更精确)
+    let mut sdiv_le_fast = 0;    // sdiv ⊆ fast_divide (sdiv 更精确)
+    let mut equal_cases = 0;     // fast_divide = sdiv (精度相同)
+    let mut incomparable = 0;    // 不可比较 (两个结果有重叠但不包含)
 
-    /// 创建位向量变量
-    pub fn create_bv(&self, name: &str, size: u32) -> BV<'ctx> {
-        BV::new_const(self.context, name, size)
-    }
-
-    /// 验证 a_val 在 Tnum {a_value, a_mask} 的范围内
-    /// 约束：(a_val XOR a_value) & !a_mask == 0
-    pub fn assert_in_tnum_range(&self, concrete_val: &BV<'ctx>, tnum_value: u64, tnum_mask: u64) {
-        let zero = BV::from_u64(self.context, 0, 64);
-        let value_bv = BV::from_u64(self.context, tnum_value, 64);
-        let mask_bv = BV::from_u64(self.context, tnum_mask, 64);
-        
-        // 约束：(concrete_val XOR tnum_value) & !tnum_mask == 0
-        let xor_result = concrete_val.bvxor(&value_bv);
-        let not_mask = mask_bv.bvnot();
-        let masked_result = xor_result.bvand(&not_mask);
-        let constraint = masked_result._eq(&zero);
-        
-        self.solver.assert(&constraint);
-    }
-
-    pub fn model_fast_divide(&self, 
-        a_value: u64, a_mask: u64, 
-        b_value: u64, b_mask: u64
-    ) -> (u64, u64) {
-        let dividend_tnum = Tnum::new(a_value, a_mask);
-        let divisor_tnum = Tnum::new(b_value, b_mask);
-        let result = dividend_tnum.fast_divide(divisor_tnum);
-        (result.value, result.mask)
-    }
-
-    /// 添加反例约束：对于具体的 a_val, b_val 值，调用 fast_divide 算法
-    pub fn assert_counterexample_with_actual_fast_divide(&self, 
-        a_val: &BV<'ctx>, 
-        b_val: &BV<'ctx>
-    ) {
-        let zero = BV::from_u64(self.context, 0, 64);
-        
-        // 创建一个布尔变量来表示是否找到反例
-        let mut counterexample_found = BV::from_u64(self.context, 0, 1); // false
-        
-        // 枚举被除数和除数的组合
-        for dividend_value in 0..=1000u64 {
-            for divisor_value in 1..=1000u64 { // 除数从1开始，避免除零
-                // 使用常数 Tnum：mask = 0
-                let dividend_tnum = Tnum::const_val(dividend_value);
-                let divisor_tnum = Tnum::const_val(divisor_value);
-                
-                // 对于这个 Tnum 组合，计算 fast_divide 的结果
-                let fast_divide_result = dividend_tnum.fast_divide(divisor_tnum);
-                
-                // 创建条件：a_val == dividend_value && b_val == divisor_value
-                let dividend_bv = BV::from_u64(self.context, dividend_value, 64);
-                let divisor_bv = BV::from_u64(self.context, divisor_value, 64);
-                let is_this_combination = Bool::and(self.context, &[
-                    &a_val._eq(&dividend_bv),
-                    &b_val._eq(&divisor_bv)
-                ]);
-                
-                // 计算真实除法结果
-                let true_result = dividend_value / divisor_value;
-                let true_result_bv = BV::from_u64(self.context, true_result, 64);
-                
-                // 检查真实结果是否在 fast_divide 结果的 Tnum 范围内
-                let fast_divide_value_bv = BV::from_u64(self.context, fast_divide_result.value, 64);
-                let fast_divide_mask_bv = BV::from_u64(self.context, fast_divide_result.mask, 64);
-                
-                // 正确的Tnum范围检查：(true_result XOR fast_divide_value) & !fast_divide_mask == 0
-                let xor_result = true_result_bv.bvxor(&fast_divide_value_bv);
-                let not_mask = fast_divide_mask_bv.bvnot(); // !mask
-                let masked_result = xor_result.bvand(&not_mask);
-                let in_range = masked_result._eq(&zero);
-                
-                // 如果真实结果不在 fast_divide 范围内，则找到反例
-                let this_is_counterexample = Bool::and(self.context, &[&is_this_combination, &in_range.not()]);
-                
-                // 更新反例标志
-                let one_bit = BV::from_u64(self.context, 1, 1);
-                counterexample_found = counterexample_found.bvor(&this_is_counterexample.ite(&one_bit, &BV::from_u64(self.context, 0, 1)));
+    // 枚举被除数 Tnum (缩小范围以便观察)
+    for value_a in 0..=4096u64 {
+        for mask_a in 0..=4096u64 {
+            // 约束：value_a & mask_a == 0
+            if value_a & mask_a != 0 {
+                continue;
             }
-        }
-        
-        // 断言
-        let one_bit = BV::from_u64(self.context, 1, 1);
-        let counterexample_constraint = counterexample_found._eq(&one_bit);
-        self.solver.assert(&counterexample_constraint);
-    }
 
-    /// 添加除数不为0的约束
-    pub fn assert_divisor_not_zero(&self, b_val: &BV<'ctx>) {
-        let zero = BV::from_u64(self.context, 0, 64);
-        let not_zero_constraint = b_val._eq(&zero).not();
-        self.solver.assert(&not_zero_constraint);
-    }
-
-    /// 添加输入范围约束
-    pub fn assert_input_bounds(&self, a_val: &BV<'ctx>, b_val: &BV<'ctx>) {
-        let max_val = BV::from_u64(self.context, u32::MAX as u64, 64);
-        self.solver.assert(&a_val.bvule(&max_val));
-        self.solver.assert(&b_val.bvule(&max_val));
-        self.solver.assert(&b_val.bvugt(&BV::from_u64(self.context, 0, 64)));
-    }
-
-    pub fn check(&self) -> SatResult {
-        self.solver.check()
-    }
-
-    pub fn get_model(&self) -> Option<z3::Model> {
-        self.solver.get_model()
-    }
-}
-
-/// 验证 fast_divide 算法的正确性
-pub fn verify_fast_divide_correctness() {
-    println!("=== 使用 Z3 验证 fast_divide 算法正确性 ===");
-    println!("验证思路：寻找反例，即存在输入 a_val, b_val 在各自 Tnum 范围内，");
-    println!("但 a_val / b_val 不在 fast_divide 结果的 Tnum 范围内。");
-    
-    let cfg = Config::new();
-    let ctx = Context::new(&cfg);
-    let verifier = FastDivideVerifier::new(&ctx);
-    
-    println!("\n=== Z3 建模验证流程 ===");
-    println!("1. 定义 Z3 位向量：a_value, a_mask, b_value, b_mask, a_val, b_val");
-    println!("2. 添加 Tnum 范围约束：(a_val XOR a_value) & !a_mask == 0");
-    println!("3. 添加除数非零约束：b_val != 0");
-    println!("4. 计算 fast_divide 结果：result_value, result_mask");
-    println!("5. 添加反例约束：((a_val / b_val) XOR result_value) & result_mask != 0");
-    println!("6. 使用 Z3 求解器检查是否存在满足所有约束的解");
-    
-    println!("\n如果 Z3 返回：");
-    println!("- SAT: 找到反例，fast_divide 算法存在错误");
-    println!("- UNSAT: 未找到反例，算法在给定约束下正确");
-    println!("- UNKNOWN: 求解器无法确定");
-    
-    println!("\n=== 开始验证 ===");
-    
-    // 被除数和除数都在范围内枚举
-    println!("验证示例：");
-    println!("  被除数范围：0 到 1000（常数 Tnum）");
-    println!("  除数范围：1 到 1000（常数 Tnum）");
-    println!("  验证策略：对每个（被除数，除数）组合调用实际的 fast_divide 算法");
-    
-    // 使用 Z3 验证
-    verifier.reset();
-    
-    // 创建符号变量
-    let a_val = verifier.create_bv("a_val", 64);
-    let b_val = verifier.create_bv("b_val", 64);
-    
-    // 添加约束
-    println!("\n添加 Z3 约束：");
-    println!("  1. a_val 在范围 [0, 1000]");
-    let max_search = BV::from_u64(&ctx, 1000, 64);
-    let zero = BV::from_u64(&ctx, 0, 64);
-    let one = BV::from_u64(&ctx, 1, 64);
-    verifier.solver.assert(&a_val.bvule(&max_search));
-    verifier.solver.assert(&a_val.bvuge(&zero));
-    
-    println!("  2. b_val 在范围 [1, 1000]（避免除零）");
-    verifier.solver.assert(&b_val.bvule(&max_search));
-    verifier.solver.assert(&b_val.bvuge(&one));
-    
-    println!("  5. 添加反例约束（使用实际 fast_divide 算法）");
-    verifier.assert_counterexample_with_actual_fast_divide(&a_val, &b_val);
-    
-    // 检查是否存在反例
-    println!("\nZ3 求解中...");
-    match verifier.check() {
-        SatResult::Sat => {
-            println!("Z3 发现反例！fast_divide 算法存在错误");
-            
-            if let Some(model) = verifier.get_model() {
-                if let (Some(a_concrete), Some(b_concrete)) = (
-                    model.eval(&a_val, true),
-                    model.eval(&b_val, true)
-                ) {
-                    if let (Some(a_num), Some(b_num)) = (
-                        a_concrete.as_u64(),
-                        b_concrete.as_u64()
-                    ) {
-                        let correct_result = a_num / b_num;
-                        println!("反例详情:");
-                        println!("  输入: a_val = {} (0b{:b}), b_val = {} (0b{:b})", 
-                                a_num, a_num, b_num, b_num);
-                        println!("  正确结果: {} ÷ {} = {} (0b{:b})", 
-                                a_num, b_num, correct_result, correct_result);
-                        
-                        // 计算对应的 fast_divide 结果
-                        let dividend_tnum = Tnum::const_val(a_num);
-                        let divisor_tnum = Tnum::const_val(b_num);
-                        let actual_fast_divide_result = dividend_tnum.fast_divide(divisor_tnum);
-                        println!("  被除数 Tnum: value={} (0b{:b}), mask={} (0b{:b}) (常数)", 
-                                a_num, a_num, 0, 0u64);
-                        println!("  除数 Tnum: value={} (0b{:b}), mask={} (0b{:b}) (常数)", 
-                                b_num, b_num, 0, 0u64);
-                        println!("  fast_divide 结果: value={} (0b{:b}), mask={} (0b{:b})", 
-                                actual_fast_divide_result.value, actual_fast_divide_result.value,
-                                actual_fast_divide_result.mask, actual_fast_divide_result.mask);
-                        
-                        // 检查范围
-                        let in_range = (correct_result ^ actual_fast_divide_result.value) & !actual_fast_divide_result.mask == 0;
-                        println!("  正确结果是否在算法结果范围内: {} (XOR: 0b{:b}, ~mask: 0b{:b}, 结果: 0b{:b})", 
-                                in_range, 
-                                correct_result ^ actual_fast_divide_result.value,
-                                !actual_fast_divide_result.mask,
-                                (correct_result ^ actual_fast_divide_result.value) & !actual_fast_divide_result.mask);
-                    }
+            // 枚举除数（常数）
+            for value_b in 0..=4096u64 { // 除数范围缩小以便观察
+                let tnum_a = Tnum::new(value_a, mask_a);
+                let tnum_b = Tnum::const_val(value_b);
+                
+                // 计算 fast_divide 和 sdiv 结果
+                let fast_result = tnum_a.fast_divide(tnum_b);
+                let sdiv_result = tnum_a.sdiv(tnum_b);
+                
+                total_cases += 1;
+                
+                // 使用 le 和 eq 函数进行比较
+                let fast_le_sdiv_bool = fast_result.le(&sdiv_result);
+                let sdiv_le_fast_bool = sdiv_result.le(&fast_result);
+                let equal_bool = fast_result.eq(&sdiv_result);
+                
+                if equal_bool {
+                    equal_cases += 1;
+                } else if fast_le_sdiv_bool && !sdiv_le_fast_bool {
+                    fast_le_sdiv += 1;
+                } else if sdiv_le_fast_bool && !fast_le_sdiv_bool {
+                    sdiv_le_fast += 1;
+                } else if fast_le_sdiv_bool && sdiv_le_fast_bool {
+                    // 这种情况应该就是 equal_bool，但以防万一
+                    equal_cases += 1;
+                } else {
+                    incomparable += 1;
                 }
             }
-        },
-        SatResult::Unsat => {
-            println!("Z3 验证通过：未发现反例");
-            println!("在给定约束下，fast_divide 算法是正确的");
-        },
-        SatResult::Unknown => {
-            println!("Z3 验证结果未知");
-            println!("可能需要调整约束或增加求解时间");
         }
     }
-    
-    println!("\n=== 验证完成 ===");
+
+    println!("=== 精度比较结果 ===");
+    println!("总测试用例数: {}", total_cases);
+    println!("fast_divide ⊆ sdiv (fast_divide 更精确): {} ({:.2}%)", 
+             fast_le_sdiv, (fast_le_sdiv as f64 / total_cases as f64) * 100.0);
+    println!("sdiv ⊆ fast_divide (sdiv 更精确): {} ({:.2}%)", 
+             sdiv_le_fast, (sdiv_le_fast as f64 / total_cases as f64) * 100.0);
+    println!("fast_divide = sdiv (精度相同): {} ({:.2}%)", 
+             equal_cases, (equal_cases as f64 / total_cases as f64) * 100.0);
+    println!("不可比较的情况: {} ({:.2}%)", 
+             incomparable, (incomparable as f64 / total_cases as f64) * 100.0);
 }
 
 fn main() {
-    verify_fast_divide_correctness();
+    compare_fast_divide_with_sdiv();
 }
